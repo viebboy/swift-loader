@@ -89,10 +89,12 @@ def signal_handler(
             Sending metadata about the number of minibatches
             """
             if not metadata_sent:
+                # Get current nb_batch (may change after rotation)
+                current_nb_batch = parent.data.nb_batch if hasattr(parent, 'data') and hasattr(parent.data, 'nb_batch') else nb_batch
                 write_pipe.send(
                     {
                         "type": CHILD_MESSAGE.METADATA.value,
-                        "nb_batch": nb_batch,
+                        "nb_batch": current_nb_batch,
                         "shared_memory": data_queue.name(),
                     }
                 )
@@ -145,7 +147,9 @@ def signal_handler(
                     # increase counter
                     nb_sent_batch += 1
 
-                    if nb_sent_batch == nb_batch:
+                    # Get current nb_batch dynamically (may change after rotation)
+                    current_nb_batch = parent.data.nb_batch if hasattr(parent, 'data') and hasattr(parent.data, 'nb_batch') else nb_batch
+                    if nb_sent_batch == current_nb_batch:
                         # end of epoch
                         nb_sent_batch = 0
                         nb_sent_epoch += 1
@@ -1138,24 +1142,27 @@ class Worker(CTX.Process):
                 resp = CHILD_MESSAGE.decode(resp)
 
                 if resp == CHILD_MESSAGE.EPOCH_END:
-                    if (
-                        self.worker_states.batch_count % self.worker_states.nb_batch
-                        != 0
-                    ):
+                    # Note: nb_batch may change after rotation, so we validate that we received
+                    # at least one batch (batch_count > 0) rather than checking exact modulo
+                    # The child process ensures the correct number of batches is sent
+                    if self.worker_states.batch_count == 0:
                         self.error(
-                            "Receive epoch end signal from child but parent count is different",
+                            "Receive epoch end signal from child but no batches were received",
                             class_method="get",
-                            total_batch_reconstructed_in_parent=self.worker_states.batch_count,
-                            nb_batch_in_epoch=self.worker_states.nb_batch,
                         )
                         raise RuntimeError(
-                            "Receive epoch end signal from child but parent count is different"
+                            "Receive epoch end signal from child but no batches were received"
                         )
+
+                    # Reset batch count for next epoch (nb_batch may change after rotation)
+                    batches_received = self.worker_states.batch_count
+                    self.worker_states.batch_count = 0
 
                     # send ack to child
                     self.front_write_pipe.send(PARENT_MESSAGE.ACK.value)
                     self.debug(
-                        "Receive epoch end signal from child", class_method="get"
+                        f"Receive epoch end signal from child, received {batches_received} batches",
+                        class_method="get"
                     )
 
                     # return epoch end signal to any processor here
@@ -1187,10 +1194,13 @@ class Worker(CTX.Process):
         if self.data.shuffle:
             # if shuffle, then dataset is divided into K (nb_worker) segments
             # each segment has consecutive samples that a worker will process
-            worker_size = int(np.ceil(len(self.data.dataset) / nb_worker))
-            # start, stop sample index
-            self.data.start = self.worker_index * worker_size
-            self.data.stop = min(self.data.start + worker_size, len(self.data.dataset))
+            # store nb_worker and worker_size for rotation in later epochs
+            self.data.nb_worker = nb_worker
+            self.data.worker_size = int(np.ceil(len(self.data.dataset) / nb_worker))
+            # start, stop sample index (for epoch 0, use original worker_index)
+            # rotation will happen in collect_minibatch when epoch ends
+            self.data.start = self.worker_index * self.data.worker_size
+            self.data.stop = min(self.data.start + self.data.worker_size, len(self.data.dataset))
             self.data.indices = list(range(self.data.start, self.data.stop))
             self.debug(
                 f"Start sample index={self.data.start}, stop sample index={self.data.stop}",
@@ -1281,9 +1291,23 @@ class Worker(CTX.Process):
             # reshuffling
             if self.data.shuffle:
                 self.data.seed += 1
+                # rotate the worker index for the next epoch
+                # rotated_worker_index = (worker_index + epoch + 1) % nb_worker
+                # Note: epoch will be incremented after this, so we use epoch + 1
+                rotated_worker_index = (self.worker_index + self.data.epoch + 1) % self.data.nb_worker
+                # recalculate start and stop based on rotated worker index
+                self.data.start = rotated_worker_index * self.data.worker_size
+                self.data.stop = min(self.data.start + self.data.worker_size, len(self.data.dataset))
                 # perform nearby shuffle to avoid too random reading
                 self.data.indices = shuffle_indices(
                     self.seed, self.data.start, self.data.stop, self.data.nearby_shuffle
+                )
+                # update nb_batch in case the number of samples changed after rotation
+                self.data.nb_batch = int(np.ceil(len(self.data.indices) / self.data.bs))
+                self.debug(
+                    f"Epoch {self.data.epoch + 1}: Rotated to worker_index={rotated_worker_index}, "
+                    f"start={self.data.start}, stop={self.data.stop}, nb_batch={self.data.nb_batch}",
+                    class_method="collect_minibatch",
                 )
             self.data.epoch += 1
 
@@ -1310,15 +1334,16 @@ class Worker(CTX.Process):
     @child_task_guard
     def start_signal_handler(self, message_queue_size: int):
         # start a thread to watch for close event
+        # Pass self (Worker instance) instead of logger so signal_handler can access self.data.nb_batch dynamically
         self.signal_thread = threading.Thread(
             target=signal_handler,
             args=(
-                self.data.nb_batch,
+                self.data.nb_batch,  # initial value, but signal_handler will read current value dynamically
                 self.back_read_pipe,
                 self.back_write_pipe,
                 self.data.mem_queue,
                 self.close_event,
-                self.logger,
+                self,  # Pass Worker instance so signal_handler can access self.data.nb_batch
                 message_queue_size,
             ),
         )
