@@ -370,22 +370,25 @@ class OrchestrateSingleWorker(threading.Thread):
                             self.epoch_end.set()
 
                             # if epoch end, we need to put until successful
-                            while not self.data_queue.put(
+                            # EPOCH_END bypasses turn ordering, so should succeed immediately
+                            if self.close_event.is_set():
+                                self.parent.debug(
+                                    "Received close event from parent. Terminating thread now",
+                                    thread_index=self.thread_index,
+                                    worker_index=self.worker.index(),
+                                    shuffle=self.shuffle,
+                                    class_name="OrchestrateSingleWorker",
+                                    class_method="run_with_buffer",
+                                )
+                                return
+                            success = self.data_queue.put(
                                 CHILD_MESSAGE.EPOCH_END, self.thread_index
-                            ):
-                                time.sleep(0.0001)
-                                if self.close_event.is_set():
-                                    # simply return if close event
-                                    self.parent.debug(
-                                        "Received close event from parent. Terminating thread now",
-                                        thread_index=self.thread_index,
-                                        worker_index=self.worker.index(),
-                                        shuffle=self.shuffle,
-                                        class_name="OrchestrateSingleWorker",
-                                        class_method="run_with_buffer",
-                                    )
-                                    return
-                            buffer.popleft()
+                            )
+                            if success:
+                                buffer.popleft()
+                            else:
+                                # Should not happen for EPOCH_END, but handle it
+                                time.sleep(0.001)
 
                         else:
                             if self.shuffle:
@@ -397,21 +400,23 @@ class OrchestrateSingleWorker(threading.Thread):
                                     # if successful, remove from buffer
                                     buffer.popleft()
                             else:
-                                while not self.data_queue.put(
+                                # For shuffle=False, put() returns False if not our turn or queue full
+                                # Use condition variable to wait efficiently instead of busy-waiting
+                                success = self.data_queue.put(
                                     buffer[0], self.thread_index
-                                ):
-                                    time.sleep(0.0001)
-                                    if self.close_event.is_set():
-                                        self.parent.debug(
-                                            "Received close event from parent. Terminating thread now",
-                                            thread_index=self.thread_index,
-                                            worker_index=self.worker.index(),
-                                            shuffle=self.shuffle,
-                                            class_name="OrchestrateSingleWorker",
-                                            class_method="run_with_buffer",
-                                        )
-                                        return
-                                buffer.popleft()
+                                )
+                                if not success:
+                                    # Not our turn or queue full - wait on condition
+                                    # The queue will notify us when turn changes or space available
+                                    with self.data_queue.condition:
+                                        # Check again after acquiring lock
+                                        if self.close_event.is_set():
+                                            return
+                                        # Wait with timeout to periodically check close_event
+                                        self.data_queue.condition.wait(timeout=0.1)
+                                    # After wait, try again in next iteration
+                                else:
+                                    buffer.popleft()
 
                 # we pull data from child process and put into buffer
                 # regardless of whether epoch has ended
@@ -490,15 +495,13 @@ class OrchestrateSingleWorker(threading.Thread):
                                     return
                         else:
                             # note that if not shuffle, we are using OrderDataQueue
-                            # so we have to wait until successful
-                            while not self.data_queue.put(
-                                CHILD_MESSAGE.EPOCH_END, self.thread_index
-                            ):
-                                time.sleep(0.0001)
-                                # need to check close event to avoid deadlock
-                                if self.close_event.is_set():
-                                    # simply return if close event
-                                    return
+                            # EPOCH_END bypasses turn ordering, should succeed immediately
+                            if self.close_event.is_set():
+                                return
+                            success = self.data_queue.put(CHILD_MESSAGE.EPOCH_END, self.thread_index)
+                            if not success:
+                                # Should not happen for EPOCH_END
+                                time.sleep(0.001)
 
                         self.parent.debug(
                             "Received epoch end signal in orchestration thread",
@@ -519,10 +522,25 @@ class OrchestrateSingleWorker(threading.Thread):
 
                         else:
                             # put into queue
-                            while not self.data_queue.put(data, self.thread_index):
-                                time.sleep(0.0001)
-                                if self.close_event.is_set():
-                                    return
+                            # Note: put() now blocks internally when shuffle=False, so no need for busy-waiting
+                            if self.shuffle:
+                                # For shuffle=True, put() may still need retries if queue is full
+                                while not self.data_queue.put(data):
+                                    time.sleep(0.0001)
+                                    if self.close_event.is_set():
+                                        return
+                            else:
+                                # For shuffle=False, put() returns False if not our turn or queue full
+                                # Use condition variable to wait efficiently
+                                success = self.data_queue.put(data, self.thread_index)
+                                if not success:
+                                    # Not our turn or queue full - wait on condition
+                                    with self.data_queue.condition:
+                                        if self.close_event.is_set():
+                                            return
+                                        # Wait with timeout to periodically check close_event
+                                        self.data_queue.condition.wait(timeout=0.1)
+                                    # After wait, try again in next iteration
                 else:
                     time.sleep(0.001)
 
@@ -806,6 +824,8 @@ class OrderDataQueue:
 
         self.data = []
         self.lock = threading.Lock()
+        # Use Condition for proper blocking instead of busy-waiting
+        self.condition = threading.Condition(self.lock)
         self.top_on_device = False
         self.cur_thread_idx = 0
         self.all_thread_indices = list(range(nb_thread))
@@ -848,26 +868,37 @@ class OrderDataQueue:
             self.cur_thread_idx = (self.cur_thread_idx + 1) % len(
                 self.all_thread_indices
             )
+        # Notify waiting threads that the turn has changed
+        self.condition.notify_all()
 
     def put(self, item: Any, thread_index: int):
         with self.lock:
             self.injection.start()
-            if self.cur_thread_idx != thread_index:
-                # only put if in the right turn
-                return False
-
+            
+            # EPOCH_END signals should bypass turn ordering to prevent deadlocks
+            # They can be put immediately regardless of turn
             if item is CHILD_MESSAGE.EPOCH_END:
                 self.data.append(CHILD_MESSAGE.EPOCH_END)
                 self.update_indices(epoch_end=True)
+                # Notify waiting threads that turn may have changed
+                self.condition.notify_all()
                 return True
+            
+            # For regular items, check if it's this thread's turn
+            if self.cur_thread_idx != thread_index:
+                # Not our turn yet
+                return False
 
-            if len(self.data) <= self.max_size:
-                self.data.append(item)
-                self.update_indices()
-                self.injection.count()
-                success = True
-            else:
-                success = False
+            # Check if queue is full
+            if len(self.data) > self.max_size:
+                # Queue is full
+                return False
+
+            # Now we can put the item
+            self.data.append(item)
+            self.update_indices()
+            self.injection.count()
+            success = True
 
             # move top item to device if needed
             if (
@@ -883,6 +914,9 @@ class OrderDataQueue:
                         self.data[self.nb_batch_on_device], self.device
                     )
                 self.nb_batch_on_device += 1
+
+            # Notify waiting threads that turn changed and queue space is available
+            self.condition.notify_all()
 
             return success
 
@@ -913,6 +947,10 @@ class OrderDataQueue:
                 self.nb_batch_on_device -= 1
 
             self.consumption.count()
+            
+            # Notify waiting threads that queue space is now available
+            self.condition.notify_all()
+            
             return item
 
 
