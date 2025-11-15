@@ -19,7 +19,6 @@ Apache 2.0
 
 """
 
-
 from __future__ import annotations
 from typing import Callable, Any
 import traceback
@@ -104,7 +103,7 @@ class SwiftLoader:
         benchmark = kwargs.get("benchmark", True)
         benchmark_file = kwargs.get("benchmark_file", None)
         validate = kwargs.get("validate", True)
-        multithread = kwargs.get("multithread", True)
+        multithread = kwargs.get("multithread", False)
         max_nb_batch_on_device = kwargs.get("max_nb_batch_on_device", 1)
         max_buffer_size = kwargs.get(
             "max_buffer_size",

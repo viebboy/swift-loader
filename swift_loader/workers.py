@@ -19,7 +19,6 @@ Apache 2.0
 
 """
 
-
 from __future__ import annotations
 from typing import Any, Callable
 from collections import deque
@@ -36,7 +35,6 @@ from swift_loader.utils import (
     BenchmarkProperty,
     ThroughputMeasure,
     Property,
-    shuffle_indices,
     get_default_collate_fn,
     get_default_to_device,
     TimeMeasure,
@@ -90,7 +88,11 @@ def signal_handler(
             """
             if not metadata_sent:
                 # Get current nb_batch (may change after rotation)
-                current_nb_batch = parent.data.nb_batch if hasattr(parent, 'data') and hasattr(parent.data, 'nb_batch') else nb_batch
+                current_nb_batch = (
+                    parent.data.nb_batch
+                    if hasattr(parent, "data") and hasattr(parent.data, "nb_batch")
+                    else nb_batch
+                )
                 write_pipe.send(
                     {
                         "type": CHILD_MESSAGE.METADATA.value,
@@ -148,7 +150,11 @@ def signal_handler(
                     nb_sent_batch += 1
 
                     # Get current nb_batch dynamically (may change after rotation)
-                    current_nb_batch = parent.data.nb_batch if hasattr(parent, 'data') and hasattr(parent.data, 'nb_batch') else nb_batch
+                    current_nb_batch = (
+                        parent.data.nb_batch
+                        if hasattr(parent, "data") and hasattr(parent.data, "nb_batch")
+                        else nb_batch
+                    )
                     if nb_sent_batch == current_nb_batch:
                         # end of epoch
                         nb_sent_batch = 0
@@ -353,29 +359,51 @@ class OrchestrateSingleWorker(threading.Thread):
                     )
                     return
 
-                # parent will unset epoch end event
-                # so when it is unset, then we can pull
-                # the idea is that we need to wait for all
-                # workers to finish their epoch before starting new ones
-                if not self.epoch_end.is_set():
-                    if len(buffer) > 0:
-                        # if there are items in buffer, try to put to data queue
-                        if buffer[0] is CHILD_MESSAGE.EPOCH_END:
-                            # set epoch end so parent knows
-                            # and we don't put batch into data_queue until the flag
-                            # is cleared by parent
-                            # we dont want to set after putting data into the queue
-                            # because parent might pull too fast and check this flag
-                            # which might not be set
-                            self.epoch_end.set()
+                # Try to put items from buffer to queue
+                # We need to process buffer even after epoch_end is set to ensure
+                # all batches are consumed before the epoch truly ends
+                if len(buffer) > 0:
+                    # if there are items in buffer, try to put to data queue
+                    if buffer[0] is CHILD_MESSAGE.EPOCH_END:
+                        # set epoch end so parent knows
+                        # and we don't put batch into data_queue until the flag
+                        # is cleared by parent
+                        # we dont want to set after putting data into the queue
+                        # because parent might pull too fast and check this flag
+                        # which might not be set
+                        self.epoch_end.set()
 
-                            # if epoch end, we need to put until successful
-                            while not self.data_queue.put(
-                                CHILD_MESSAGE.EPOCH_END, self.thread_index
-                            ):
-                                time.sleep(0.0001)
+                        # if epoch end, we need to put until successful
+                        while not self.data_queue.put(
+                            CHILD_MESSAGE.EPOCH_END, self.thread_index
+                        ):
+                            time.sleep(0.01)
+                            if self.close_event.is_set():
+                                # simply return if close event
+                                self.parent.debug(
+                                    "Received close event from parent. Terminating thread now",
+                                    thread_index=self.thread_index,
+                                    worker_index=self.worker.index(),
+                                    shuffle=self.shuffle,
+                                    class_name="OrchestrateSingleWorker",
+                                    class_method="run_with_buffer",
+                                )
+                                return
+                        buffer.popleft()
+
+                    else:
+                        # Process regular batches - continue even if epoch_end is set
+                        # to ensure all batches are consumed
+                        if self.shuffle:
+                            # if shuffling, we dont need to wait until successful
+                            success = self.data_queue.put(buffer[0], self.thread_index)
+                            if success:
+                                # if successful, remove from buffer
+                                buffer.popleft()
+                        else:
+                            while not self.data_queue.put(buffer[0], self.thread_index):
+                                time.sleep(0.01)
                                 if self.close_event.is_set():
-                                    # simply return if close event
                                     self.parent.debug(
                                         "Received close event from parent. Terminating thread now",
                                         thread_index=self.thread_index,
@@ -386,44 +414,26 @@ class OrchestrateSingleWorker(threading.Thread):
                                     )
                                     return
                             buffer.popleft()
-
-                        else:
-                            if self.shuffle:
-                                # if shuffling, we dont need to wait until successful
-                                success = self.data_queue.put(
-                                    buffer[0], self.thread_index
-                                )
-                                if success:
-                                    # if successful, remove from buffer
-                                    buffer.popleft()
-                            else:
-                                while not self.data_queue.put(
-                                    buffer[0], self.thread_index
-                                ):
-                                    time.sleep(0.0001)
-                                    if self.close_event.is_set():
-                                        self.parent.debug(
-                                            "Received close event from parent. Terminating thread now",
-                                            thread_index=self.thread_index,
-                                            worker_index=self.worker.index(),
-                                            shuffle=self.shuffle,
-                                            class_name="OrchestrateSingleWorker",
-                                            class_method="run_with_buffer",
-                                        )
-                                        return
-                                buffer.popleft()
-
-                # we pull data from child process and put into buffer
-                # regardless of whether epoch has ended
-                # that's the idea of using buffer
-                if len(buffer) < self.max_buffer_size:
-                    data = self.worker.get()
-
-                    if data is not None:
-                        buffer.append(data)
-                else:
-                    # if buffer is also full, then we need to wait
+                elif self.epoch_end.is_set():
+                    # If buffer is empty and epoch_end is set, we should NOT pull
+                    # more data from the worker until the flag is cleared.
+                    # This prevents pulling batches from the next epoch before
+                    # the parent is ready to start a new epoch.
+                    # The buffer decouples producer/consumer, but we must respect
+                    # epoch boundaries to avoid mixing epochs.
                     time.sleep(0.001)
+                else:
+                    # we pull data from child process and put into buffer
+                    # only when epoch_end is not set, to avoid pulling batches
+                    # from the next epoch prematurely
+                    if len(buffer) < self.max_buffer_size:
+                        data = self.worker.get()
+
+                        if data is not None:
+                            buffer.append(data)
+                    else:
+                        # if buffer is also full, then we need to wait
+                        time.sleep(0.001)
 
         except BaseException as error:
             # get traceback content
@@ -483,7 +493,7 @@ class OrchestrateSingleWorker(threading.Thread):
                         if self.shuffle:
                             # if empty, then try to put to the queue
                             while not self.data_queue.put(CHILD_MESSAGE.EPOCH_END):
-                                time.sleep(0.0001)
+                                time.sleep(0.01)
                                 # need to check close event to avoid deadlock
                                 if self.close_event.is_set():
                                     # simply return if close event
@@ -494,7 +504,7 @@ class OrchestrateSingleWorker(threading.Thread):
                             while not self.data_queue.put(
                                 CHILD_MESSAGE.EPOCH_END, self.thread_index
                             ):
-                                time.sleep(0.0001)
+                                time.sleep(0.01)
                                 # need to check close event to avoid deadlock
                                 if self.close_event.is_set():
                                     # simply return if close event
@@ -512,7 +522,7 @@ class OrchestrateSingleWorker(threading.Thread):
                         if self.shuffle:
                             # put until successful
                             while not self.data_queue.put(data):
-                                time.sleep(0.0001)
+                                time.sleep(0.01)
                                 # need to check close event to avoid deadlock
                                 if self.close_event.is_set():
                                     return
@@ -520,7 +530,7 @@ class OrchestrateSingleWorker(threading.Thread):
                         else:
                             # put into queue
                             while not self.data_queue.put(data, self.thread_index):
-                                time.sleep(0.0001)
+                                time.sleep(0.01)
                                 if self.close_event.is_set():
                                     return
                 else:
@@ -590,7 +600,8 @@ def orchestrate_multiple_workers(
 
                         # still need to put epoch end signal into queue
                         # epoch end will be forcefully put so it's always successful
-                        data_queue.put(CHILD_MESSAGE.EPOCH_END)
+                        # DataQueue.put() requires a dummy parameter
+                        data_queue.put(CHILD_MESSAGE.EPOCH_END, 0)
                         parent.debug(
                             "Receved epoch end signal in orchestration thread",
                             method="orchestrate_multiple_workers",
@@ -600,7 +611,8 @@ def orchestrate_multiple_workers(
                         # put into queue
                         # note that if queue is full, then need to wait
                         # put returns True if putting data successfully
-                        while not data_queue.put(data):
+                        # DataQueue.put() requires a dummy parameter
+                        while not data_queue.put(data, 0):
                             time.sleep(0.005)
                             # remember to check close event to avoid deadlock
                             if close_event.is_set():
@@ -618,10 +630,14 @@ def orchestrate_multiple_workers(
 
                             # still need to put epoch end signal into queue
                             # epoch end will be forcefully put so it's always successful
-                            data_queue.put(CHILD_MESSAGE.EPOCH_END)
+                            # DataQueue.put() requires a dummy parameter
+                            data_queue.put(CHILD_MESSAGE.EPOCH_END, 0)
                             break
                         elif data is not None:
-                            while not data_queue.put(data):
+                            # DataQueue.put() requires a dummy parameter
+                            # When shuffle=False and multithread=False, we use DataQueue
+                            # which doesn't enforce ordering, so we can use any dummy value
+                            while not data_queue.put(data, 0):
                                 time.sleep(0.005)
                                 if close_event.is_set():
                                     # simply return if close event
@@ -830,20 +846,47 @@ class OrderDataQueue:
         self.benchmark = benchmark
         self.logger = benchmark_logger
 
-    def update_indices(self, epoch_end=False):
+    def update_indices(self, epoch_end=False, thread_index=None):
         if epoch_end:
-            if self.cur_thread_idx == len(self.all_thread_indices) - 1:
-                # if last index --> next index will be 0
-                self.all_thread_indices.pop(self.cur_thread_idx)
-                self.cur_thread_idx = 0
-            else:
-                # not last, then we just keep the current index without incrementing
-                # because we already remove the cur element
-                self.all_thread_indices.pop(self.cur_thread_idx)
+            # When epoch_end=True, thread_index must be provided
+            # to know which thread index to remove
+            if thread_index is None:
+                raise ValueError("thread_index must be provided when epoch_end=True")
+
+            # Find the position of thread_index in all_thread_indices
+            try:
+                idx_pos = self.all_thread_indices.index(thread_index)
+            except ValueError:
+                # Thread index not found, might have been removed already
+                # This can happen if multiple threads finish simultaneously
+                return
+
+            # Remove the thread index from all_thread_indices
+            # cur_thread_idx is an index into all_thread_indices list
+            # We need to adjust it BEFORE removing the element
+            if self.cur_thread_idx > idx_pos:
+                # If cur_thread_idx points to an element after the one we're
+                # removing, decrement it since the list will shift left
+                self.cur_thread_idx -= 1
+            elif self.cur_thread_idx == idx_pos:
+                # If cur_thread_idx points to the element we're removing,
+                # we need to point to the next valid element
+                # After removal, the element at idx_pos+1 (if exists) will
+                # be at idx_pos, or we wrap to 0
+                if idx_pos < len(self.all_thread_indices) - 1:
+                    # There's an element after, it will move to idx_pos
+                    # cur_thread_idx stays the same (now points to next element)
+                    pass
+                else:
+                    # We're removing the last element, wrap to 0
+                    self.cur_thread_idx = 0
+
+            self.all_thread_indices.pop(idx_pos)
 
             if len(self.all_thread_indices) == 0:
                 # if no more thread, then reset
                 self.all_thread_indices = list(range(self.nb_thread))
+                self.cur_thread_idx = 0
         else:
             self.cur_thread_idx = (self.cur_thread_idx + 1) % len(
                 self.all_thread_indices
@@ -852,14 +895,26 @@ class OrderDataQueue:
     def put(self, item: Any, thread_index: int):
         with self.lock:
             self.injection.start()
-            if self.cur_thread_idx != thread_index:
-                # only put if in the right turn
-                return False
 
+            # EPOCH_END is a special signal that should bypass turn-based
+            # ordering to prevent deadlock when threads finish at different
+            # times
             if item is CHILD_MESSAGE.EPOCH_END:
                 self.data.append(CHILD_MESSAGE.EPOCH_END)
-                self.update_indices(epoch_end=True)
+                self.update_indices(epoch_end=True, thread_index=thread_index)
                 return True
+
+            # Check if thread_index is still in all_thread_indices
+            # If not, this thread has already finished, so reject
+            if thread_index not in self.all_thread_indices:
+                return False
+
+            # Get the expected thread index from all_thread_indices
+            expected_thread_idx = self.all_thread_indices[self.cur_thread_idx]
+
+            if expected_thread_idx != thread_index:
+                # only put if in the right turn
+                return False
 
             if len(self.data) <= self.max_size:
                 self.data.append(item)
@@ -1162,7 +1217,7 @@ class Worker(CTX.Process):
                     self.front_write_pipe.send(PARENT_MESSAGE.ACK.value)
                     self.debug(
                         f"Receive epoch end signal from child, received {batches_received} batches",
-                        class_method="get"
+                        class_method="get",
                     )
 
                     # return epoch end signal to any processor here
@@ -1197,13 +1252,30 @@ class Worker(CTX.Process):
             # store nb_worker and worker_size for rotation in later epochs
             self.data.nb_worker = nb_worker
             self.data.worker_size = int(np.ceil(len(self.data.dataset) / nb_worker))
-            # start, stop sample index (for epoch 0, use original worker_index)
-            # rotation will happen in collect_minibatch when epoch ends
-            self.data.start = self.worker_index * self.data.worker_size
-            self.data.stop = min(self.data.start + self.data.worker_size, len(self.data.dataset))
-            self.data.indices = list(range(self.data.start, self.data.stop))
+
+            # Calculate initial start position and N_k (number of samples for this worker)
+            # N_k is fixed for this worker across all epochs
+            initial_start = self.worker_index * self.data.worker_size
+            initial_stop = min(
+                initial_start + self.data.worker_size, len(self.data.dataset)
+            )
+            self.data.worker_sample_count = initial_stop - initial_start
+
+            # Set initial start position
+            self.data.start = initial_start
+
+            # Calculate indices using rotation-shift formula
+            # sample_indices = [(data.start + i) % len(dataset) for i in range(N_k)]
+            dataset_size = len(self.data.dataset)
+            self.data.indices = [
+                (self.data.start + i) % dataset_size
+                for i in range(self.data.worker_sample_count)
+            ]
+
             self.debug(
-                f"Start sample index={self.data.start}, stop sample index={self.data.stop}",
+                f"nb_worker={nb_worker}, worker_size={self.data.worker_size}, "
+                f"worker_sample_count={self.data.worker_sample_count}, "
+                f"start={self.data.start}",
                 class_method="prepare_dataset",
             )
 
@@ -1282,7 +1354,12 @@ class Worker(CTX.Process):
 
     def collect_minibatch(self):
         stop = min(self.data.cur + self.data.bs, len(self.data.indices))
-        data = [self.data.dataset[i] for i in self.data.indices[self.data.cur : stop]]
+        minibatch_indices = self.data.indices[self.data.cur : stop]
+        self.debug(
+            f"Collecting minibatch from indices {minibatch_indices}",
+            class_method="collect_minibatch",
+        )
+        data = [self.data.dataset[i] for i in minibatch_indices]
 
         if stop == len(self.data.indices):
             # end of epoch
@@ -1291,24 +1368,52 @@ class Worker(CTX.Process):
             # reshuffling
             if self.data.shuffle:
                 self.data.seed += 1
-                # rotate the worker index for the next epoch
-                # rotated_worker_index = (worker_index + epoch + 1) % nb_worker
-                # Note: epoch will be incremented after this, so we use epoch + 1
-                rotated_worker_index = (self.worker_index + self.data.epoch + 1) % self.data.nb_worker
-                # recalculate start and stop based on rotated worker index
-                self.data.start = rotated_worker_index * self.data.worker_size
-                self.data.stop = min(self.data.start + self.data.worker_size, len(self.data.dataset))
+                # New rotation strategy: rotation-shift by worker_size
+                # This ensures that after rotation, all workers together
+                # still cover all samples exactly once
+                dataset_size = len(self.data.dataset)
+                self.data.start = (
+                    self.data.start + self.data.worker_size
+                ) % dataset_size
+
+                # Calculate indices using rotation-shift formula
+                # sample_indices = [(data.start + i) % len(dataset) for i in range(N_k)]
+                self.data.indices = [
+                    (self.data.start + i) % dataset_size
+                    for i in range(self.data.worker_sample_count)
+                ]
+
                 # perform nearby shuffle to avoid too random reading
-                self.data.indices = shuffle_indices(
-                    self.seed, self.data.start, self.data.stop, self.data.nearby_shuffle
+                # Since we have a list of indices (which may wrap around),
+                # we need to shuffle them directly
+                random.seed(self.seed)
+                if self.data.nearby_shuffle > 0 and len(self.data.indices) > 1:
+                    # Apply nearby shuffle logic similar to shuffle_indices
+                    i = random.choice(range(1, len(self.data.indices) - 1))
+                    indices_ = self.data.indices[i:] + self.data.indices[:i]
+                    self.data.indices = []
+                    start_index = 0
+                    N = len(indices_)
+                    while len(self.data.indices) < N:
+                        stop_index = min(N, start_index + self.data.nearby_shuffle)
+                        sub_indices = indices_[start_index:stop_index]
+                        random.shuffle(sub_indices)
+                        self.data.indices.extend(sub_indices)
+                        start_index = stop_index
+                else:
+                    random.shuffle(self.data.indices)
+
+                # nb_batch remains the same since worker_sample_count is fixed
+                self.data.nb_batch = int(
+                    np.ceil(self.data.worker_sample_count / self.data.bs)
                 )
-                # update nb_batch in case the number of samples changed after rotation
-                self.data.nb_batch = int(np.ceil(len(self.data.indices) / self.data.bs))
                 self.debug(
-                    f"Epoch {self.data.epoch + 1}: Rotated to worker_index={rotated_worker_index}, "
-                    f"start={self.data.start}, stop={self.data.stop}, nb_batch={self.data.nb_batch}",
+                    f"Epoch {self.data.epoch + 1}: Rotation-shifted start to "
+                    f"{self.data.start}, worker_sample_count={self.data.worker_sample_count}, "
+                    f"nb_batch={self.data.nb_batch}",
                     class_method="collect_minibatch",
                 )
+
             self.data.epoch += 1
 
             epoch_time = time.perf_counter() - self.data.epoch_start
