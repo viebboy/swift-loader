@@ -2,7 +2,21 @@
 
 ## Installation
 
-Install the dependencies in `requirements.txt` then simply run 
+### From Source
+
+```bash
+cd src
+pip install -e .
+```
+
+### With Development Dependencies
+
+```bash
+cd src
+pip install -e ".[dev]"
+```
+
+### From Git Repository
 
 ```bash
 pip install --upgrade git+https://github.com/viebboy/swift-loader.git
@@ -58,30 +72,30 @@ use the default function that recursively moves all `numpy` or `torch.Tensor` to
 If you're familiar with `Fabric` from `Lightning AI`, please checkout [fabric_example.py](./examples/fabric_example.py)
 
 
-## All Aguments
+## All Arguments
 
 In addition to the mandatory arguments, the following keyword arguments are supported:
 
-- `seed_numer`: (int) this number is used to in builtin `random` module. Default to `int(time.time()*1000)`
-- `data_queue_size`: (int) number of minibatches in the queues (queue in child processes, queue in parent process). Default to `10`
-- `message_queue_size`: (int) number of telcom messages (not minibatches) that can stay in pipe. Default to `10`
+- `seed`: (int) this number is used in the builtin `random` module. Defaults to `int(time.time()*1000)`
+- `data_queue_size`: (int) number of minibatches in the queues (queue in child processes, queue in parent process). Defaults to `10`
+- `message_queue_size`: (int) number of telecommunication messages (not minibatches) that can stay in pipe. Defaults to `10`
 - `collate_fn`: (callable) the function used to collate/batch samples. If not provided, `SwiftLoader` will use the default function, which only works with nested lists.
 - `logger`: (str, dict): if a `str` is provided, it should be the file prefix to save log files. If a `dict` is provided, it could have the following keys:
     - `path`: (str) file prefix to dump the log files
     - `stdout`: (bool) if True, will print to standard output
     - `level`: (str) log level
 - `batch_encoder`: (callable) because minibatches are prepared in child processes, they need to be serialized. Users can provide custom function to serialize a minibatch to bytes. If not provided, `dill.dumps` will be used. 
-- `batch_decoder`: (callable) if `batch_encoder` is provided, users should also provide `batch_encoder` to reconstruct a minibatch from bytes. Default to `dill.loads`.
+- `batch_decoder`: (callable) if `batch_encoder` is provided, users should also provide `batch_decoder` to reconstruct a minibatch from bytes. Defaults to `dill.loads`.
 - `nearby_shuffle`: (int) this number limits the amount of randomness when getting samples from dataset. 
   Higher numbers lead to more randomness but might also affect performance of getting samples from the dataset if the implementation involves accessing a large binary files. 
-  Default to `5 * batch_size`
-- `benchmark`: (bool) whether to perform various benchmark of dataloading and so on. Default to `True`. 
+  Defaults to `5 * batch_size`
+- `benchmark`: (bool) whether to perform various benchmarks of data loading and so on. Defaults to `True`. 
 - `benchmark_file`: (str) if provided, the benchmark results are written to this file. Otherwise, it will be written to the log file if `logger` is defined. 
-- `validate`: (bool) whether to test run the dataset and batching step before launching the workers. Default to `True`. 
+- `validate`: (bool) whether to test run the dataset and batching step before launching the workers. Defaults to `True`. 
   If constructing a dataset is expensive and you are certain that dataset creation and batching have no issue, you can turn off this step to save some time. 
-- `multithread`: (bool) if True, will use multiple threads, each thread will handle the telcom with one worker. Default to True. 
-- `max_nb_batch_on_device`: (int) if data should be moved to device, this defines how many minibatches will stay on the device at the same time. Default to `1`
-- `max_buffer_size`: maximum size of the buffer when reconstructing data from workers. Default to `max(2, data_queue_size//worker_per_consumer)`
+- `multithread`: (bool) if True, will use multiple threads, each thread will handle the telecommunication with one worker. Defaults to `False`. 
+- `max_nb_batch_on_device`: (int) if data should be moved to device, this defines how many minibatches will stay on the device at the same time. Defaults to `1`
+- `max_buffer_size`: maximum size of the buffer when reconstructing data from workers. Defaults to `max(2, data_queue_size//worker_per_consumer)`
 
 
 ## Authors

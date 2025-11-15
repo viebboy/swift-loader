@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swift_loader"
+dynamic = ["version"]
+description = "Multiprocess data loader for ML training"
+readme = "README.md"
+requires-python = ">=3.7"
+authors = [{ name = "Dat Tran", email = "hello@dats.bio" }]
+classifiers = [
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+dependencies = ["dill", "numpy", "structlog"]
+
+[project.optional-dependencies]
+dev = ["black", "pre-commit", "autoflake", "pytest", "mypy"]
+
+[tool.setuptools]
+packages = ["swift_loader"]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = { attr = "swift_loader.version.__version__" }
+
+[tool.black]
+line-length = 120
+target-version = ['py37', 'py38', 'py39', 'py310', 'py311']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.flake8]
+ignore = ["E203", "W503"]
+max-line-length = 120
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    ".mypy_cache",
+    ".pytest_cache",
+    "swift_loader.egg-info",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.7"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+exclude = ["build/", "dist/", "swift_loader.egg-info/", "tests/"]

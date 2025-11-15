@@ -1,7 +1,8 @@
-"""
-workers.py: multiprocessing implementation
-------------------------------------------
+"""Multiprocessing implementation for SwiftLoader.
 
+This module provides the core multiprocessing infrastructure for SwiftLoader,
+including worker processes, worker management, data queues, and inter-process
+communication.
 
 * Copyright: 2023 Dat Tran
 * Authors: Dat Tran
@@ -9,14 +10,9 @@ workers.py: multiprocessing implementation
 * Date: 2023-11-12
 * Version: 0.0.1
 
-
-This is part of the swift_loader package
-
-
 License
 -------
 Apache 2.0
-
 """
 
 from __future__ import annotations
@@ -55,16 +51,24 @@ def signal_handler(
     close_event: threading.Event,
     parent: Worker,
     max_pipe_size: int,
-):
-    """
-    Thread (run in child process) to communicate with parent process
+) -> None:
+    """Thread (run in child process) to communicate with parent process.
 
-    It first sends metadata related to the part of dataset handled by this worker
-    and waits for PARENT_MESSAGE.ACK from parent
+    This function runs in a thread within the child process to handle
+    communication with the parent process. It:
+    1. Sends metadata about the dataset portion handled by this worker
+    2. Waits for PARENT_MESSAGE.ACK from parent
+    3. Pulls data from data_queue and sends data info to parent
+    4. Sends CHILD_MESSAGE.EPOCH_END after an epoch finishes
 
-    Then it starts to pull out data from data_queue and send data info to parent
-
-    After an epoch finishes, it sends CHILD_MESSAGE.EPOCH_END to parent
+    Args:
+        nb_batch: Initial number of batches (may change after rotation).
+        read_pipe: Pipe for reading messages from parent.
+        write_pipe: Pipe for writing messages to parent.
+        data_queue: Shared memory queue containing batch data.
+        close_event: Event to signal thread termination.
+        parent: Worker instance (for accessing dynamic nb_batch).
+        max_pipe_size: Maximum number of unacknowledged messages in pipe.
     """
 
     try:
@@ -603,7 +607,7 @@ def orchestrate_multiple_workers(
                         # DataQueue.put() requires a dummy parameter
                         data_queue.put(CHILD_MESSAGE.EPOCH_END, 0)
                         parent.debug(
-                            "Receved epoch end signal in orchestration thread",
+                            "Received epoch end signal in orchestration thread",
                             method="orchestrate_multiple_workers",
                         )
 
@@ -687,9 +691,25 @@ def orchestrate_multiple_workers(
 
 
 class DataQueue:
-    """
-    Data queue used in parent process to store reconstructed data
-    This queue handles shuffled data
+    """Data queue used in parent process to store reconstructed data.
+
+    This queue handles shuffled data. Batches can be retrieved in any order.
+    Supports device transfer and benchmarking.
+
+    Attributes:
+        max_size: Maximum queue size.
+        device: Target device for data.
+        to_device: Function to move data to device.
+        data: List storing queued batches.
+        lock: Thread lock for thread-safe operations.
+        nb_batch_on_device: Number of batches currently on device.
+        max_nb_batch_on_device: Maximum batches to keep on device.
+        injection: Throughput measure for data injection.
+        consumption: Throughput measure for data consumption.
+        transfer_to_device: Benchmark property for device transfer.
+        time_measure: Time measure class (TimeMeasure or DummyTimeMeasure).
+        benchmark: Whether benchmarking is enabled.
+        logger: Logger instance.
     """
 
     def __init__(
@@ -715,10 +735,14 @@ class DataQueue:
 
         if benchmark:
             self.injection = ThroughputMeasure(
-                max_count=size - 1, task_name="injection", logger=benchmark_logger
+                max_count=size - 1,
+                task_name="injection",
+                logger=benchmark_logger,
             )
             self.consumption = ThroughputMeasure(
-                max_count=size - 1, task_name="consumption", logger=benchmark_logger
+                max_count=size - 1,
+                task_name="consumption",
+                logger=benchmark_logger,
             )
             self.transfer_to_device = BenchmarkProperty(max_count=size - 1)
             self.time_measure = TimeMeasure
@@ -797,10 +821,30 @@ class DataQueue:
 
 
 class OrderDataQueue:
-    """
-    Data queue used in parent process to store reconstructed data
-    This queue handles non-shuffled data, i.e., a batch is put
-    into the queue only when its turn comes
+    """Data queue for non-shuffled data with turn-based ordering.
+
+    This queue handles non-shuffled data where batches must be put into
+    the queue in a specific order based on thread turns. Ensures batches
+    are processed in the correct sequence.
+
+    Attributes:
+        max_size: Maximum queue size.
+        device: Target device for data.
+        to_device: Function to move data to device.
+        data: List storing queued batches.
+        lock: Thread lock for thread-safe operations.
+        top_on_device: Flag indicating if top item is on device.
+        cur_thread_idx: Current thread index for turn-based ordering.
+        all_thread_indices: List of active thread indices.
+        nb_thread: Total number of threads.
+        max_nb_batch_on_device: Maximum batches to keep on device.
+        nb_batch_on_device: Number of batches currently on device.
+        injection: Throughput measure for data injection.
+        consumption: Throughput measure for data consumption.
+        transfer_to_device: Benchmark property for device transfer.
+        time_measure: Time measure class.
+        benchmark: Whether benchmarking is enabled.
+        logger: Logger instance.
     """
 
     def __init__(
@@ -831,10 +875,14 @@ class OrderDataQueue:
 
         if benchmark:
             self.injection = ThroughputMeasure(
-                max_count=size - 1, task_name="injection", logger=benchmark_logger
+                max_count=size - 1,
+                task_name="injection",
+                logger=benchmark_logger,
             )
             self.consumption = ThroughputMeasure(
-                max_count=size - 1, task_name="consumption", logger=benchmark_logger
+                max_count=size - 1,
+                task_name="consumption",
+                logger=benchmark_logger,
             )
             self.transfer_to_device = BenchmarkProperty(max_count=size - 1)
             self.time_measure = TimeMeasure
@@ -972,8 +1020,30 @@ class OrderDataQueue:
 
 
 class Worker(CTX.Process):
-    """
-    Worker process that loads data and batches them
+    """Worker process that loads data and batches them.
+
+    A Worker process is responsible for:
+    - Loading data from the dataset
+    - Batching samples
+    - Encoding batches
+    - Storing batches in shared memory
+    - Communicating with parent process via pipes
+
+    Attributes:
+        front_read_pipe: Pipe for reading from parent.
+        back_write_pipe: Pipe for writing to parent.
+        back_read_pipe: Pipe for reading from signal handler.
+        front_write_pipe: Pipe for writing to signal handler.
+        dataset_file: Path to serialized dataset configuration.
+        nb_consumer: Number of consumer processes.
+        worker_per_consumer: Number of workers per consumer.
+        consumer_index: Index of this worker's consumer.
+        worker_index: Global index of this worker.
+        name: Name of the worker process.
+        side: Side of process ("parent" or "child").
+        worker_states: Property object tracking worker state.
+        logger: Logger instance.
+        shared_memory: Shared memory instance for reading data.
     """
 
     def __init__(
@@ -1507,7 +1577,7 @@ class Worker(CTX.Process):
             self.print_log(message, **clarifications)
             return
 
-        self.logger.warning(
+        self.logger.error(
             message,
             **clarifications,
         )
@@ -1648,9 +1718,27 @@ class Worker(CTX.Process):
 
 
 class WorkerManager:
-    """
-    Manager that handles multiple workers
-    Also expose iterator interface
+    """Manager that handles multiple workers and exposes iterator interface.
+
+    WorkerManager coordinates multiple worker processes, manages data queues,
+    and provides an iterator interface for consuming batches.
+
+    Attributes:
+        dataset_file: Path to serialized dataset configuration.
+        nb_consumer: Number of consumer processes.
+        worker_per_consumer: Number of workers per consumer.
+        device: Target device for data (e.g., "cuda:0").
+        to_device: Function to move data to device.
+        shuffle: Whether data is shuffled.
+        seed: Random seed.
+        data_queue_size: Maximum size of data queue.
+        max_buffer_size: Maximum buffer size.
+        max_nb_batch_on_device: Maximum batches to keep on device.
+        multithread: Whether to use multithreading.
+        orchestrate_thread: Thread for orchestrating workers.
+        worker: Property object containing worker-related state.
+        started: Flag indicating if manager has been started.
+        closed: Flag indicating if manager has been closed.
     """
 
     REQUIRED_PARAMS = [
@@ -1756,7 +1844,11 @@ class WorkerManager:
 
         except BaseException as error:
             traceback_content = traceback.format_exc()
-            self.error(str(error), class_method="__next__", traceback=traceback_content)
+            self.error(
+                str(error),
+                class_method="__next__",
+                traceback=traceback_content,
+            )
             self.close()
             raise error
 
@@ -2012,7 +2104,7 @@ class WorkerManager:
             self.print_log(message, **clarifications)
             return
 
-        self.logger.warning(
+        self.logger.error(
             message,
             **clarifications,
         )
